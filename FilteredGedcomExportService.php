@@ -443,6 +443,10 @@ class FilteredGedcomExportService extends GedcomExportService
         //Assume GEDCOM 7 export, if first item in record list is a GEDCOM 7 header
         $gedcom7 = ($this->isGedcom7Header($gedcom_export[0] ?? false));
 
+        if ($gedcom7) {
+            $gedcom_export = $this->normalizeGedcom7Identifiers($gedcom_export);
+        }
+
         // If requested, add SCHMA for extension tags found
         if ($gedcom7 && $this->use_schema_tag_analysis) {
 
@@ -1261,12 +1265,65 @@ class FilteredGedcomExportService extends GedcomExportService
     }
 
     /**
-     * Assess whether a Gedcom structure contains a Gedcom 7 header
+     * Normalize GEDCOM 5 identifiers and pointer payloads for GEDCOM 7 output.
+     * Literal text, email addresses and media paths are not identifier tokens.
+     * Missing targets remain missing; this does not invent records.
      *
-     * @param string $gedcom    Gedcom structure
-     *
-     * @return bool             True if is a Gedcom 7 header, otherwise false
+     * @param array<string> $records
+     * @return array<string>
      */
+    private function normalizeGedcom7Identifiers(array $records) : array {
+
+        // Reserve every valid identifier before allocating replacements. Merely
+        // uppercasing identifiers would merge distinct records such as @i1@ and @I1@.
+        $identifiers = [];
+        $reserved = ['@VOID@' => true];
+        $void_record = false;
+        $definition = '/^0 (@[^@\r\n]+@) ([A-Za-z0-9_]+)/m';
+        $pointer = '/^([0-9]+ (?:ALIA|ANCI|ASSO|DESI|FAMC|FAMS|HUSB|WIFE|CHIL|NOTE|SNOTE|OBJE|REPO|SOUR|SUBM|SUBN|_[A-Za-z0-9_]+)) (@[^@\r\n]+@)$/m';
+
+        foreach ($records as $record) {
+            preg_match_all($definition, $record, $definitions);
+            preg_match_all($pointer, $record, $pointers);
+            $void_record = $void_record || in_array('@VOID@', $definitions[1], true);
+            foreach (array_merge($definitions[1], $pointers[2]) as $identifier) {
+                $identifiers[$identifier] = true;
+                if (preg_match('/^@[A-Z0-9_]+@$/D', $identifier) === 1) {
+                    $reserved[$identifier] = true;
+                }
+            }
+        }
+
+        $replacements = [];
+        $next = 1;
+        foreach ($identifiers as $identifier => $unused) {
+            if (preg_match('/^@[A-Z0-9_]+@$/D', $identifier) === 1 && !($identifier === '@VOID@' && $void_record)) {
+                continue;
+            }
+            $replacement = strtoupper($identifier);
+            if (preg_match('/^@[A-Z0-9_]+@$/D', $replacement) !== 1 || isset($reserved[$replacement])) {
+                do {
+                    $replacement = '@X' . $next++ . '@';
+                } while (isset($reserved[$replacement]));
+            }
+            $replacements[$identifier] = $replacement;
+            $reserved[$replacement] = true;
+        }
+
+        foreach ($records as &$record) {
+            $record = preg_replace_callback($definition, static function (array $match) use ($replacements) : string {
+                return '0 ' . ($replacements[$match[1]] ?? $match[1]) . ' ' . $match[2];
+            }, $record);
+            $record = preg_replace_callback($pointer, static function (array $match) use ($replacements) : string {
+                return $match[1] . ' ' . ($replacements[$match[2]] ?? $match[2]);
+            }, $record);
+        }
+        unset($record);
+
+        return $records;
+    }
+
+    /** Assess whether the record is a GEDCOM 7 header. */
     private function isGedcom7Header(string $gedcom) : bool {
 
         preg_match('/0 (HEAD|TRLR)/', $gedcom, $match);
@@ -1301,6 +1358,15 @@ class FilteredGedcomExportService extends GedcomExportService
             $this->addToSchemas($schema_uris_for_tags, self::SCHEMAS);
             $this->addToSchemas($schema_uris_for_tags, self::GEDCOM_L_SCHEMAS);
 
+            // The old lists include catalog URLs shared by unrelated extensions.
+            // A SCHMA URI identifies a meaning, not a catalog. Leave these tags
+            // undeclared rather than falsely declaring them synonymous, or inventing
+            // undocumented URIs. Keep explicit declarations supplied by the input.
+            $uri_counts = array_count_values($schema_uris_for_tags);
+            $schema_uris_for_tags = array_filter($schema_uris_for_tags, static function (string $uri) use ($uri_counts) : bool {
+                return $uri_counts[$uri] === 1;
+            });
+
             //Find custom tags
             $custom_tags_with_schema = [];
 
@@ -1323,14 +1389,22 @@ class FilteredGedcomExportService extends GedcomExportService
             //Get Gedcom of HEAD
             $head_gedcom = $gedcom_structures[0];
 
+            preg_match_all('/^2 TAG (_[^ ]+) /m', $head_gedcom, $declared_tags);
+            $custom_tags_with_schema = array_diff($custom_tags_with_schema, $declared_tags[1]);
+
             //Append SCHMA structure to HEAD
             if (sizeof($custom_tags_with_schema) > 0) {
 
-                $head_gedcom .= "1 SCHMA\n";
-
+                $declarations = '';
                 foreach($custom_tags_with_schema as $tag) {
-
-                    $head_gedcom .= "2 TAG " . $tag . " " . $schema_uris_for_tags[$tag] . "\n";
+                    $declarations .= "2 TAG " . $tag . " " . $schema_uris_for_tags[$tag] . "\n";
+                }
+                if (strpos($head_gedcom, "1 SCHMA\n") !== false) {
+                    $head_gedcom = preg_replace_callback('/^1 SCHMA\n/m', static function () use ($declarations) : string {
+                        return "1 SCHMA\n" . $declarations;
+                    }, $head_gedcom, 1);
+                } else {
+                    $head_gedcom .= "1 SCHMA\n" . $declarations;
                 }
             }
 

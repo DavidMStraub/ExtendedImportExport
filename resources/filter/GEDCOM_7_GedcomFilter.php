@@ -67,6 +67,9 @@ class GEDCOM_7_GedcomFilter extends AbstractGedcomFilter
 
         //RELA, ROLE, _ASSO
         'INDI:ASSO'		            => ["RegExp_macro" => "ASSO_RELA"],
+        'INDI:*:ASSO'              => ["RegExp_macro" => "ASSO_RELA"],
+        'FAM:*:ASSO'               => ["RegExp_macro" => "ASSO_RELA"],
+        'INDI:_ASSO'               => ["RegExp_macro" => "ASSO_RELA"],
         'INDI:*:_ASSO'	 	        => ["RegExp_macro" => "ASSO_RELA"],
         'FAM:*:_ASSO'	            => ["RegExp_macro" => "ASSO_RELA"],
 
@@ -76,14 +79,10 @@ class GEDCOM_7_GedcomFilter extends AbstractGedcomFilter
         //Media types
         //Allowed GEDCOM 7 media types: https://www.iana.org/assignments/media-types/media-types.xhtml
         //GEDCOM 5.5.1 media types: bmp | gif | jpg | ole | pcx | tif | wav
-        'OBJE:FILE:FORM'            => ["2 FORM (?i)(BMP)"      => "2 FORM image/bmp",
-                                        "2 FORM (?i)(GIF)"      => "2 FORM image/gif",
-                                        "2 FORM (?i)(JPG|JPEG)" => "2 FORM image/jpeg",
-                                        "2 FORM (?i)(TIFF)"     => "2 FORM image/tiff",
-                                        "2 FORM (?i)(TIF)"      => "2 FORM image/tiff",
-                                        "2 FORM (?i)(PDF)"      => "2 FORM application/pdf",
-                                        "2 FORM (?i)(EMF)"      => "2 FORM image/emf",
-                                        "2 FORM (?i)(HTM|HTML)" => "2 FORM text/html",],
+        'OBJE:FILE:FORM'            => ["PHP_function" => "customConvert"],
+        '*:OBJE:FILE:FORM'          => ["PHP_function" => "customConvert"],
+        '*:*:OBJE:FILE:FORM'        => ["PHP_function" => "customConvert"],
+        '*:*:*:OBJE:FILE:FORM'      => ["PHP_function" => "customConvert"],
 
         //Shared notes (SNOTE)
         '*:NOTE'					=> ["RegExp_macro" => "SharedNotes"],
@@ -158,10 +157,7 @@ class GEDCOM_7_GedcomFilter extends AbstractGedcomFilter
 
         "UIdConversion"				=> ["([\d]) _UID (.*)" => "$1 UID $2"],
 
-        "ASSO_RELA"					=> ["([\d]) RELA (?i)GODPARENT" => "$1 RELA GODP",
-                                        "([\d]) RELA (?i)WITNESS" => "$1 RELA WITN",
-                                        "([\d]) (_?)ASSO ([^\n]*)\n([\d]) RELA" => "$1 ASSO $3\n$4 ROLE",
-                                        "PHP_function" => "customConvert"],
+        "ASSO_RELA"                 => ["PHP_function" => "customConvert"],
 
         "ROLE_GodparentWitness"		=> ["([\d]) ROLE \((?i)GODPARENT\)" => "$1 ROLE GODP",
                                         "([\d]) ROLE (?i)GODPARENT" => "$1 ROLE GODP",
@@ -226,7 +222,42 @@ class GEDCOM_7_GedcomFilter extends AbstractGedcomFilter
      */
     public function customConvert(string $pattern, string $gedcom, array &$records_list, array $params = []): string {
 
-        if (strpos($pattern, ':DATE') > 0) {
+        if (substr($pattern, -5) === ':ASSO' || substr($pattern, -6) === ':_ASSO') {
+            // RELA can follow other children, not necessarily the ASSO line.
+            preg_match('/^([0-9]+) _?ASSO /', $gedcom, $association);
+            $level = (int) $association[1] + 1;
+            $gedcom = preg_replace('/^([0-9]+) _ASSO /', '$1 ASSO ', $gedcom);
+            $gedcom = preg_replace_callback('/^' . $level . ' RELA ([^\n]+)\n/m', static function (array $match) use ($level) : string {
+                $description = $match[1];
+                $role = strtoupper($description);
+                $role = ['GODPARENT' => 'GODP', 'GODFATHER' => 'GODP', 'GODMOTHER' => 'GODP', 'WITNESS' => 'WITN'][$role] ?? $role;
+                if (!in_array($role, self::ENUMSETS['ROLE'], true)) {
+                    $role = 'OTHER';
+                }
+                $result = $level . ' ROLE ' . $role . "\n";
+                if ($role === 'OTHER' || in_array(strtoupper($description), ['GODFATHER', 'GODMOTHER'], true)) {
+                    // Preserve the full relationship, including gender and wording.
+                    $phrase = strpos($description, '@') === 0 ? '@' . $description : $description;
+                    $result .= ($level + 1) . ' PHRASE ' . $phrase . "\n";
+                }
+                return $result;
+            }, $gedcom);
+        }
+        elseif (substr($pattern, -14) === 'OBJE:FILE:FORM') {
+            // Match the complete legacy value: prefixes such as HTML and existing
+            // MIME values must not be partially replaced (e.g. text/htmlL).
+            $media_types = [
+                'BMP' => 'image/bmp', 'GIF' => 'image/gif',
+                'JPG' => 'image/jpeg', 'JPEG' => 'image/jpeg',
+                'PNG' => 'image/png', 'TIF' => 'image/tiff', 'TIFF' => 'image/tiff',
+                'PDF' => 'application/pdf', 'EMF' => 'image/emf',
+                'HTM' => 'text/html', 'HTML' => 'text/html',
+            ];
+            $gedcom = preg_replace_callback('/^([0-9]+ FORM) ([^\n]+)\n/m', static function (array $match) use ($media_types) : string {
+                return $match[1] . ' ' . ($media_types[strtoupper($match[2])] ?? $match[2]) . "\n";
+            }, $gedcom);
+        }
+        elseif (strpos($pattern, ':DATE') > 0) {
 
             //Specific dates with slashes in years, eg. 1741/42
             $preg_pattern = [
